@@ -1,7 +1,7 @@
 package tfexec
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -29,10 +29,19 @@ var (
 	tfVersionMismatchConstraintRegexp = regexp.MustCompile(`required_version = "(.+)"|Required version: (.+)\b`)
 )
 
-func (tf *Terraform) parseError(err error, stderr string) error {
-	ee, ok := err.(*exec.ExitError)
+func (tf *Terraform) wrapExitError(ctx context.Context, err error, stderr string) error {
+	exitErr, ok := err.(*exec.ExitError)
 	if !ok {
+		// not an exit error, short circuit, nothing to wrap
 		return err
+	}
+
+	ctxErr := ctx.Err()
+
+	// nothing to parse, return early
+	errString := strings.TrimSpace(stderr)
+	if errString == "" {
+		return &unwrapper{exitErr, ctxErr}
 	}
 
 	switch {
@@ -58,6 +67,8 @@ func (tf *Terraform) parseError(err error, stderr string) error {
 		}
 
 		return &ErrTFVersionMismatch{
+			unwrapper: unwrapper{exitErr, ctxErr},
+
 			Constraint: constraint,
 			TFVersion:  ver,
 		}
@@ -71,33 +82,77 @@ func (tf *Terraform) parseError(err error, stderr string) error {
 			}
 		}
 
-		return &ErrMissingVar{name}
+		return &ErrMissingVar{
+			unwrapper: unwrapper{exitErr, ctxErr},
+
+			VariableName: name,
+		}
 	case usageRegexp.MatchString(stderr):
-		return &ErrCLIUsage{stderr: stderr}
+		return &ErrCLIUsage{
+			unwrapper: unwrapper{exitErr, ctxErr},
+
+			stderr: stderr,
+		}
 	case noInitErrRegexp.MatchString(stderr):
-		return &ErrNoInit{stderr: stderr}
+		return &ErrNoInit{
+			unwrapper: unwrapper{exitErr, ctxErr},
+
+			stderr: stderr,
+		}
 	case noConfigErrRegexp.MatchString(stderr):
-		return &ErrNoConfig{stderr: stderr}
+		return &ErrNoConfig{
+			unwrapper: unwrapper{exitErr, ctxErr},
+
+			stderr: stderr,
+		}
 	case workspaceDoesNotExistRegexp.MatchString(stderr):
 		submatches := workspaceDoesNotExistRegexp.FindStringSubmatch(stderr)
 		if len(submatches) == 2 {
-			return &ErrNoWorkspace{submatches[1]}
+			return &ErrNoWorkspace{
+				unwrapper: unwrapper{exitErr, ctxErr},
+
+				Name: submatches[1],
+			}
 		}
 	case workspaceAlreadyExistsRegexp.MatchString(stderr):
 		submatches := workspaceAlreadyExistsRegexp.FindStringSubmatch(stderr)
 		if len(submatches) == 2 {
-			return &ErrWorkspaceExists{submatches[1]}
+			return &ErrWorkspaceExists{
+				unwrapper: unwrapper{exitErr, ctxErr},
+
+				Name: submatches[1],
+			}
 		}
 	}
-	errString := strings.TrimSpace(stderr)
-	if errString == "" {
-		// if stderr is empty, return the ExitError directly, as it will have a better message
-		return ee
+
+	return fmt.Errorf("%w\n%s", &unwrapper{exitErr, ctxErr}, stderr)
+}
+
+type unwrapper struct {
+	err    error
+	ctxErr error
+}
+
+func (u *unwrapper) Unwrap() error {
+	return u.err
+}
+
+func (u *unwrapper) Is(target error) bool {
+	switch target {
+	case context.DeadlineExceeded, context.Canceled:
+		return u.ctxErr == context.DeadlineExceeded ||
+			u.ctxErr == context.Canceled
 	}
-	return errors.New(stderr)
+	return false
+}
+
+func (u *unwrapper) Error() string {
+	return u.err.Error()
 }
 
 type ErrMissingVar struct {
+	unwrapper
+
 	VariableName string
 }
 
@@ -106,6 +161,8 @@ func (err *ErrMissingVar) Error() string {
 }
 
 type ErrNoWorkspace struct {
+	unwrapper
+
 	Name string
 }
 
@@ -115,6 +172,8 @@ func (err *ErrNoWorkspace) Error() string {
 
 // ErrWorkspaceExists is returned when creating a workspace that already exists
 type ErrWorkspaceExists struct {
+	unwrapper
+
 	Name string
 }
 
@@ -123,6 +182,8 @@ func (err *ErrWorkspaceExists) Error() string {
 }
 
 type ErrNoInit struct {
+	unwrapper
+
 	stderr string
 }
 
@@ -131,6 +192,8 @@ func (e *ErrNoInit) Error() string {
 }
 
 type ErrNoConfig struct {
+	unwrapper
+
 	stderr string
 }
 
@@ -147,6 +210,8 @@ func (e *ErrNoConfig) Error() string {
 // Currently cases 1 and 2 are handled.
 // TODO KEM: Handle exit 127 case. How does this work on non-Unix platforms?
 type ErrCLIUsage struct {
+	unwrapper
+
 	stderr string
 }
 
@@ -157,6 +222,8 @@ func (e *ErrCLIUsage) Error() string {
 // ErrTFVersionMismatch is returned when the running Terraform version is not compatible with the
 // value specified for required_version in the terraform block.
 type ErrTFVersionMismatch struct {
+	unwrapper
+
 	TFVersion string
 
 	// Constraint is not returned in the error messaging on 0.12
